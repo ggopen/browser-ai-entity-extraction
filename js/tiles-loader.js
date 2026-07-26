@@ -150,9 +150,42 @@ function parseGlbBinary(glbBuf) {
   const bin = binChunks[0];
   if (!bin) return group;
 
+  // glTF 1.0 represents its "JSON objects" (e.g. meshes, accessors,
+  // bufferViews) as arrays of string keys, with the actual data stored
+  // at the top level of the JSON under those keys. Detect this format
+  // and look data up via json[keyName] rather than json.array[i].
+  const isDict = (node) => Array.isArray(node) && node.length > 0
+    && node.every((x) => typeof x === 'string' && json[x] !== undefined);
+
+  const meshKeys = isDict(json.meshes) ? json.meshes : null;
+  const accessorKeys = isDict(json.accessors) ? json.accessors : null;
+  const bufferViewKeys = isDict(json.bufferViews) ? json.bufferViews : null;
+
+  // Resolve a bufferView reference (either a string key for glTF 1.0
+  // dict form, or a numeric index for glTF 2.0 array form).
+  const resolveBufferView = (ref) => {
+    if (typeof ref === 'number') return json.bufferViews?.[ref];
+    if (typeof ref === 'string') {
+      if (bufferViewKeys && bufferViewKeys.includes(ref)) return json[ref];
+      return json.bufferViews?.[ref];
+    }
+    return undefined;
+  };
+
+  // Resolve an accessor reference similarly.
+  const resolveAccessor = (ref) => {
+    if (typeof ref === 'number') return json.accessors?.[ref];
+    if (typeof ref === 'string') {
+      if (accessorKeys && accessorKeys.includes(ref)) return json[ref];
+      return json.accessors?.[ref];
+    }
+    return undefined;
+  };
+
   // Helper: read accessor as a typed array view into the BIN data
   function readAccessor(acc) {
-    const bv = json.bufferViews[acc.bufferView];
+    const bv = resolveBufferView(acc.bufferView);
+    if (!bv) throw new Error(`Accessor 引用了未知的 bufferView: ${acc.bufferView}`);
     const compT = acc.componentType;
     const TypedArray = COMPONENT_TYPE[compT];
     const elemBytes = COMPONENT_BYTES[compT];
@@ -163,7 +196,10 @@ function parseGlbBinary(glbBuf) {
   }
 
   // For each mesh primitive, build a Three.js BufferGeometry
-  for (const mesh of json.meshes || []) {
+  const meshList = meshKeys
+    ? meshKeys.map((k) => json[k]).filter(Boolean)
+    : (Array.isArray(json.meshes) ? json.meshes : []);
+  for (const mesh of meshList) {
     for (const prim of mesh.primitives || []) {
       try {
         const g = new THREE.BufferGeometry();
@@ -182,8 +218,12 @@ function parseGlbBinary(glbBuf) {
         };
         // Attributes
         const attrs = prim.attributes || {};
-        for (const [name, accIdx] of Object.entries(attrs)) {
-          const acc = json.accessors[accIdx];
+        for (const [name, accRef] of Object.entries(attrs)) {
+          const acc = resolveAccessor(accRef);
+          if (!acc) {
+            logger.warn(`属性 ${name} 引用了未知的 accessor: ${accRef}`);
+            continue;
+          }
           const arr = readAccessor(acc);
           const itemSize = TYPE_SIZE[acc.type];
           const threeName = SEMANTIC_MAP[name] || name;
@@ -191,7 +231,11 @@ function parseGlbBinary(glbBuf) {
         }
         // Indices
         if (prim.indices !== undefined) {
-          const acc = json.accessors[prim.indices];
+          const acc = resolveAccessor(prim.indices);
+          if (!acc) {
+            logger.warn(`索引引用了未知的 accessor: ${prim.indices}`);
+            continue;
+          }
           const arr = readAccessor(acc);
           const itemSize = TYPE_SIZE[acc.type];
           g.setIndex(new THREE.BufferAttribute(arr, itemSize));
@@ -215,13 +259,42 @@ function parseGlbBinary(glbBuf) {
 const gltfLoader = new GLTFLoader();
 const gltfCache = new Map();
 
+// fetch with retry for transient 5xx / network errors. The remote tile
+// service at data.mars3d.cn frequently returns 503 under load; we back
+// off and retry a couple of times before giving up.
+async function fetchWithRetry(url, attempts = 3) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const r = await fetch(url);
+      if (r.ok) return r;
+      // Retry on transient 5xx and 429
+      if (r.status >= 500 || r.status === 429) {
+        lastErr = new Error(`HTTP ${r.status} for ${url}`);
+        if (i < attempts - 1) {
+          const wait = 400 * Math.pow(2, i) + Math.random() * 200;
+          logger.warn(`瓦片 ${url.split('/').pop()} 返回 ${r.status}，${wait.toFixed(0)} ms 后重试 (${i + 1}/${attempts})`);
+          await new Promise((res) => setTimeout(res, wait));
+          continue;
+        }
+      }
+      throw new Error(`HTTP ${r.status} for ${url}`);
+    } catch (e) {
+      lastErr = e;
+      if (i < attempts - 1) {
+        const wait = 400 * Math.pow(2, i) + Math.random() * 200;
+        logger.warn(`瓦片 ${url.split('/').pop()} 请求失败: ${e.message}，${wait.toFixed(0)} ms 后重试 (${i + 1}/${attempts})`);
+        await new Promise((res) => setTimeout(res, wait));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 function loadGlb(url) {
   if (gltfCache.has(url)) return gltfCache.get(url);
-  const promise = fetch(url)
-    .then((r) => {
-      if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
-      return r.arrayBuffer();
-    })
+  const promise = fetchWithRetry(url)
+    .then((r) => r.arrayBuffer())
     .then((buf) => {
       const header = parseB3dmHeader(buf);
       const glbBuf = extractGlb(buf, header.glbOffset);
@@ -407,8 +480,7 @@ export class Tileset {
 
   async load(tilesetUrl) {
     this.url = tilesetUrl;
-    const r = await fetch(tilesetUrl);
-    if (!r.ok) throw new Error(`Failed to load tileset.json: HTTP ${r.status}`);
+    const r = await fetchWithRetry(tilesetUrl);
     this.root = await r.json();
     logger.info(`已加载 tileset.json，根节点 boundingSphere 半径 = ${this.root.root.boundingVolume.sphere[3].toFixed(1)} m`);
     return this;
@@ -424,8 +496,7 @@ export class Tileset {
     const leaves = [];
     const baseUrl = this.url.substring(0, this.url.lastIndexOf('/') + 1);
     const fetchJson = async (u) => {
-      const r = await fetch(u);
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const r = await fetchWithRetry(u);
       return r.json();
     };
     await collectLeafTiles(this.root.root, queryBox, leaves, baseUrl, fetchJson);
