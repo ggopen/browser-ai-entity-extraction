@@ -155,19 +155,58 @@ function boxIntersects(a, b) {
 }
 
 // Walk the tileset, return all leaf tiles (or those with .content) whose
-// bounding box intersects the given query box.
-function collectLeafTiles(root, queryBox, out, depth = 0, maxDepth = 20) {
+// bounding box intersects the given query box. `baseUrl` is the URL of
+// the file that contains this subtree, used to resolve relative content
+// URLs. This is async because inner tilesets may need to be fetched
+// (their URL ends in .json).
+async function collectLeafTiles(root, queryBox, out, baseUrl, fetchJson, depth = 0, maxDepth = 25) {
   if (!root || depth > maxDepth) return;
   const box = makeBoundingBox3(root.boundingVolume);
   if (box.isEmpty()) return;
-  // Conservative: if boxes intersect, descend
   if (!boxIntersects(box, queryBox)) return;
-  if (root.content && root.content.url) {
-    out.push(root);
-  }
-  if (root.children) {
+
+  // If this node has children, we always prefer to descend (children
+  // carry higher-detail versions of the same content). We only fall
+  // back to the .content of this node when there are no children AND
+  // the content is a b3dm (or similar binary).
+  if (root.children && root.children.length > 0) {
     for (const child of root.children) {
-      collectLeafTiles(child, queryBox, out, depth + 1, maxDepth);
+      // If this node's content is a sub-tileset json, the children of
+      // this node live in that sub-tileset's URL space. We do not need
+      // to re-fetch the sub-tileset here: it was already fetched when
+      // we recorded THIS node as a leaf (handled in the else branch
+      // below) OR the recursion already entered the sub-tileset via
+      // the explicit "isJson" branch.
+      //
+      // However, the inner Tile_p003_p004.json has its OWN children
+      // whose content points to .b3dm. We want those children to be
+      // discovered. So we descend using this node's baseUrl.
+      await collectLeafTiles(child, queryBox, out, baseUrl, fetchJson, depth + 1, maxDepth);
+    }
+    return;
+  }
+
+  // Leaf: process the content.
+  if (root.content && root.content.url) {
+    const ref = root.content.url;
+    const isJson = /\.json($|\?)/i.test(ref);
+    if (isJson) {
+      let url = ref;
+      if (!url.startsWith('http') && !url.startsWith('blob')) {
+        url = baseUrl + url;
+      }
+      try {
+        const sub = await fetchJson(url);
+        const idx = url.lastIndexOf('/');
+        const subBase = idx >= 0 ? url.substring(0, idx + 1) : url + '/';
+        const subRoot = sub.root || sub;
+        await collectLeafTiles(subRoot, queryBox, out, subBase, fetchJson, depth + 1, maxDepth);
+      } catch (err) {
+        logger.warn(`子 tileset 加载失败 ${url}: ${err.message}`);
+      }
+    } else {
+      // b3dm or other binary content
+      out.push({ tile: root, baseUrl });
     }
   }
 }
@@ -200,21 +239,26 @@ export class Tileset {
   // intersect queryBox (in ECEF). Loads tiles lazily, evicts old ones.
   async getMeshesInBox(queryBox) {
     const leaves = [];
-    collectLeafTiles(this.root.root, queryBox, leaves);
+    const baseUrl = this.url.substring(0, this.url.lastIndexOf('/') + 1);
+    const fetchJson = async (u) => {
+      const r = await fetch(u);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    };
+    await collectLeafTiles(this.root.root, queryBox, leaves, baseUrl, fetchJson);
     if (leaves.length === 0) {
       logger.warn('指定包围盒内未找到任何 3D Tiles 瓦片');
       return [];
     }
     logger.info(`包围盒内候选瓦片 ${leaves.length} 个，开始加载...`);
 
-    const baseUrl = this.url.substring(0, this.url.lastIndexOf('/') + 1);
     const loaded = [];
     let i = 0;
-    for (const tile of leaves) {
+    for (const { tile, baseUrl: tileBase } of leaves) {
       i++;
       let url = tile.content.url;
       if (!url.startsWith('http') && !url.startsWith('blob')) {
-        url = baseUrl + url;
+        url = tileBase + url;
       }
       try {
         const t0 = performance.now();
