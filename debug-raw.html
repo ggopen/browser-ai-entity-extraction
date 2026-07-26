@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>Debug b3dm - Raw</title>
+</head>
+<body>
+  <h1>Debug b3dm - Raw fetch test</h1>
+  <pre id="out" style="font-family: monospace; white-space: pre-wrap;"></pre>
+  <script>
+    const out = document.getElementById('out');
+    function log(msg) {
+      out.textContent += msg + '\n';
+      console.log(msg);
+    }
+
+    async function run() {
+      try {
+        log('Fetching tile.b3dm...');
+        const r = await fetch('./mock-tileset/tile.b3dm');
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const buf = await r.arrayBuffer();
+        log('b3dm size: ' + buf.byteLength);
+        log('b3dm byteLength hex: ' + buf.byteLength.toString(16));
+
+        const view = new DataView(buf);
+        const magic = view.getUint32(0, true);
+        log('b3dm magic: 0x' + magic.toString(16));
+        log('b3dm version: ' + view.getUint32(4, true));
+        log('b3dm byteLength: ' + view.getUint32(8, true));
+        log('b3dm ftJsonLen: ' + view.getUint32(12, true));
+        log('b3dm ftBinLen: ' + view.getUint32(16, true));
+        log('b3dm btJsonLen: ' + view.getUint32(20, true));
+        log('b3dm btBinLen: ' + view.getUint32(24, true));
+
+        // Try to construct the Uint8Array
+        const ftJsonLen = view.getUint32(12, true);
+        const raw = new Uint8Array(buf, 28, ftJsonLen);
+        log('raw.length: ' + raw.length);
+        log('raw bytes: ' + Array.from(raw).map(b => b.toString(16).padStart(2, '0').padStart(2, '0')).join(' '));
+        log('raw[17] hex: ' + raw[17].toString(16));
+        log('raw[18] hex: ' + raw[18].toString(16));
+        log('raw[19] hex: ' + raw[19].toString(16));
+
+        // Test parsing
+        const text = new TextDecoder('utf-8').decode(raw);
+        log('text: ' + JSON.stringify(text));
+        log('text length: ' + text.length);
+        try {
+          const j = JSON.parse(text);
+          log('parse OK: ' + JSON.stringify(j));
+        } catch (e) {
+          log('parse error: ' + e.message);
+          // Try trimmed
+          const trimmed = text.replace(/[\x00\x09\x0a\x0d\x20]+$/, '');
+          log('trimmed: ' + JSON.stringify(trimmed));
+          try {
+            const j2 = JSON.parse(trimmed);
+            log('trimmed parse OK: ' + JSON.stringify(j2));
+          } catch (e2) {
+            log('trimmed parse error: ' + e2.message);
+          }
+        }
+      } catch (e) {
+        log('Error: ' + e.message);
+        log('Stack: ' + e.stack);
+      }
+    }
+    run();
+  </script>
+</body>
+</html>
