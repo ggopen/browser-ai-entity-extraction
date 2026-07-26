@@ -165,28 +165,12 @@ async function collectLeafTiles(root, queryBox, out, baseUrl, fetchJson, depth =
   if (box.isEmpty()) return;
   if (!boxIntersects(box, queryBox)) return;
 
-  // If this node has children, we always prefer to descend (children
-  // carry higher-detail versions of the same content). We only fall
-  // back to the .content of this node when there are no children AND
-  // the content is a b3dm (or similar binary).
-  if (root.children && root.children.length > 0) {
-    for (const child of root.children) {
-      // If this node's content is a sub-tileset json, the children of
-      // this node live in that sub-tileset's URL space. We do not need
-      // to re-fetch the sub-tileset here: it was already fetched when
-      // we recorded THIS node as a leaf (handled in the else branch
-      // below) OR the recursion already entered the sub-tileset via
-      // the explicit "isJson" branch.
-      //
-      // However, the inner Tile_p003_p004.json has its OWN children
-      // whose content points to .b3dm. We want those children to be
-      // discovered. So we descend using this node's baseUrl.
-      await collectLeafTiles(child, queryBox, out, baseUrl, fetchJson, depth + 1, maxDepth);
-    }
-    return;
-  }
-
-  // Leaf: process the content.
+  // If this node has a content URL pointing to a sub-tileset JSON, the
+  // node is essentially a reference to that sub-tileset (the children
+  // declared here, if any, are typically redundant with the
+  // sub-tileset's children). We always recurse into the sub-tileset
+  // when its bounding box intersects our query box, and we ignore the
+  // inline children (which would otherwise re-fetch the same data).
   if (root.content && root.content.url) {
     const ref = root.content.url;
     const isJson = /\.json($|\?)/i.test(ref);
@@ -204,9 +188,29 @@ async function collectLeafTiles(root, queryBox, out, baseUrl, fetchJson, depth =
       } catch (err) {
         logger.warn(`子 tileset 加载失败 ${url}: ${err.message}`);
       }
+      // Still descend into inline children in case there are additional
+      // tiles here (e.g. loose b3dm content references).
+      if (root.children && root.children.length > 0) {
+        for (const child of root.children) {
+          await collectLeafTiles(child, queryBox, out, baseUrl, fetchJson, depth + 1, maxDepth);
+        }
+      }
+      return;
     } else {
-      // b3dm or other binary content
-      out.push({ tile: root, baseUrl });
+      // Binary content (b3dm) at this node
+      if (!root.children || root.children.length === 0) {
+        out.push({ tile: root, baseUrl });
+        return;
+      }
+      // Has children AND binary content: descend into children to find
+      // the higher-detail versions.
+    }
+  }
+
+  // If this node has children, descend.
+  if (root.children && root.children.length > 0) {
+    for (const child of root.children) {
+      await collectLeafTiles(child, queryBox, out, baseUrl, fetchJson, depth + 1, maxDepth);
     }
   }
 }
