@@ -105,50 +105,109 @@ function parseGlbBinary(glbBuf) {
   }
   const version = dv.getUint32(4, true);
   const length = dv.getUint32(8, true);
-  // Walk chunks
-  let offset = 12;
+
   let json = null;
-  let binChunks = []; // { offset, byteLength }
-  while (offset < length) {
-    const chunkLen = dv.getUint32(offset, true); offset += 4;
-    const chunkType = dv.getUint32(offset, true); offset += 4;
-    const data = new Uint8Array(glbBuf, offset, chunkLen);
-    if (chunkType === 0x4E4F534A) { // 'JSON'
-      // The JSON chunk is padded with spaces (0x20) to 4 bytes; trim
-      // them off before parsing.
-      const raw = new Uint8Array(glbBuf, offset, chunkLen);
-      // Find the actual end of JSON by trimming any combination of
-      // null bytes, spaces, tabs, CR, LF.
-      let end = chunkLen;
-      while (end > 0) {
-        const b = raw[end - 1];
-        if (b === 0x20 || b === 0x09 || b === 0x0a || b === 0x0d || b === 0x00) end--;
-        else break;
-      }
-      const text = new TextDecoder('utf-8').decode(raw.subarray(0, end));
-      try {
-        json = JSON.parse(text);
-      } catch (e) {
-        logger.error(`GLB JSON 解析失败: ${e.message}`);
-        // Try to find the offending character
-        const m = /at position (\d+)/.exec(e.message);
-        if (m) {
-          const pos = parseInt(m[1], 10);
-          logger.error(`附近内容: ${JSON.stringify(text.slice(Math.max(0, pos - 20), pos + 20))}`);
-        }
-        throw e;
-      }
-    } else if (chunkType === 0x004E4942) { // 'BIN\0'
-      binChunks.push({ offset, byteLength: chunkLen });
+  let binOffset = -1;
+  let binLength = 0;
+
+  if (version < 2) {
+    // glTF 1.0 binary format used by KHR_binary_glTF tiles in b3dm:
+    //   12-byte header (magic, version, length)
+    //   4-byte JSON chunk length
+    //   4-byte BIN chunk length (0 means "BIN extends to end of file")
+    //   JSON data (NOT padded to 4-byte boundary in this format)
+    //   BIN data (NOT padded; extends to the end if the BIN length was 0)
+    // The BIN data holds buffers referenced by the JSON via the
+    // bufferView byteOffsets.
+    const jsonLen = dv.getUint32(12, true);
+    const declaredBinLen = dv.getUint32(16, true);
+    // JSON data starts at offset 20 (after the 4-byte JSON length and
+    // 4-byte BIN length). It is NOT padded to a 4-byte boundary.
+    const jsonDataOff = 20;
+    if (jsonDataOff + jsonLen > glbBuf.byteLength) {
+      throw new Error(`glTF 1.0 JSON 长度越界: ${jsonLen}`);
     }
-    // Pad to 4 bytes
-    offset += chunkLen + ((4 - (chunkLen % 4)) % 4);
+    const raw = new Uint8Array(glbBuf, jsonDataOff, jsonLen);
+    let end = jsonLen;
+    while (end > 0) {
+      const b = raw[end - 1];
+      if (b === 0x20 || b === 0x09 || b === 0x0a || b === 0x0d || b === 0x00) end--;
+      else break;
+    }
+    const text = new TextDecoder('utf-8').decode(raw.subarray(0, end));
+    try {
+      json = JSON.parse(text);
+    } catch (e) {
+      logger.error(`GLB JSON 解析失败: ${e.message}`);
+      const m = /at position (\d+)/.exec(e.message);
+      if (m) {
+        const pos = parseInt(m[1], 10);
+        logger.error(`附近内容: ${JSON.stringify(text.slice(Math.max(0, pos - 20), pos + 20))}`);
+      }
+      throw e;
+    }
+    // JSON is NOT padded to 4-byte boundary in this format; BIN starts
+    // immediately after the last byte of JSON. The BIN offset within
+    // the file may not be 4-byte aligned, so we copy it into a fresh
+    // ArrayBuffer for safe TypedArray construction.
+    const srcBinOffset = jsonDataOff + jsonLen;
+    const srcBinLength = declaredBinLen > 0
+      ? declaredBinLen
+      : Math.max(0, length - srcBinOffset);
+    if (srcBinLength <= 0) {
+      // No BIN data; group will be empty.
+      return new THREE.Group();
+    }
+    // Copy into a new, properly-aligned ArrayBuffer.
+    const binCopy = new Uint8Array(srcBinLength);
+    binCopy.set(new Uint8Array(glbBuf, srcBinOffset, srcBinLength));
+    binOffset = 0;
+    binLength = srcBinLength;
+    // Replace glbBuf with a buffer that starts at the BIN copy. The
+    // accessors reference byte offsets relative to the BIN, so an
+    // ArrayBuffer that starts at the BIN keeps the existing offset
+    // arithmetic correct.
+    glbBuf = binCopy.buffer;
+  } else {
+    // glTF 2.0 binary format with typed chunks:
+    //   12-byte header (magic, version, length)
+    //   then 0..N chunks, each with an 8-byte header (length, type) and
+    //   data padded to 4-byte boundary. Type is 'JSON' (0x4E4F534A) or
+    //   'BIN\0' (0x004E4942).
+    let offset = 12;
+    while (offset < length) {
+      if (offset + 8 > length) break;
+      const chunkLen = dv.getUint32(offset, true); offset += 4;
+      const chunkType = dv.getUint32(offset, true); offset += 4;
+      if (chunkType === 0x4E4F534A) { // 'JSON'
+        if (offset + chunkLen > glbBuf.byteLength) {
+          throw new Error(`glTF 2.0 JSON 长度越界: ${chunkLen}`);
+        }
+        const raw = new Uint8Array(glbBuf, offset, chunkLen);
+        let end = chunkLen;
+        while (end > 0) {
+          const b = raw[end - 1];
+          if (b === 0x20 || b === 0x09 || b === 0x0a || b === 0x0d || b === 0x00) end--;
+          else break;
+        }
+        const text = new TextDecoder('utf-8').decode(raw.subarray(0, end));
+        try {
+          json = JSON.parse(text);
+        } catch (e) {
+          logger.error(`GLB JSON 解析失败: ${e.message}`);
+          throw e;
+        }
+      } else if (chunkType === 0x004E4942) { // 'BIN\0'
+        binOffset = offset;
+        binLength = chunkLen;
+      }
+      offset += chunkLen + ((4 - (chunkLen % 4)) % 4);
+    }
   }
   if (!json) throw new Error('GLB has no JSON chunk');
 
   const group = new THREE.Group();
-  const bin = binChunks[0];
-  if (!bin) return group;
+  if (binOffset < 0) return group;
 
   // glTF 1.0 represents its "JSON objects" (e.g. meshes, accessors,
   // bufferViews) as arrays of string keys, with the actual data stored
@@ -188,11 +247,28 @@ function parseGlbBinary(glbBuf) {
     if (!bv) throw new Error(`Accessor 引用了未知的 bufferView: ${acc.bufferView}`);
     const compT = acc.componentType;
     const TypedArray = COMPONENT_TYPE[compT];
-    const elemBytes = COMPONENT_BYTES[compT];
+    if (!TypedArray) throw new Error(`未知的 componentType: ${compT}`);
     const typeCount = TYPE_SIZE[acc.type];
+    if (!typeCount) throw new Error(`未知的 accessor type: ${acc.type}`);
+    const compBytes = COMPONENT_BYTES[compT];
     const total = acc.count * typeCount;
+    // Sanity-check: refuse obviously bogus values that would crash
+    // TypedArray construction or read past the BIN chunk.
+    const byteLen = total * compBytes;
+    if (!Number.isFinite(total) || total < 0 || byteLen > binLength) {
+      throw new Error(
+        `Accessor 越界: count=${acc.count}, type=${acc.type}, ` +
+        `byteLength=${byteLen}, binLength=${binLength}`
+      );
+    }
     const byteOffset = (bv.byteOffset || 0) + (acc.byteOffset || 0);
-    return new TypedArray(glbBuf, bin.offset + byteOffset, total);
+    if (byteOffset + byteLen > binLength) {
+      throw new Error(
+        `Accessor 越界: byteOffset=${byteOffset}, byteLength=${byteLen}, ` +
+        `binLength=${binLength}`
+      );
+    }
+    return new TypedArray(glbBuf, binOffset + byteOffset, total);
   }
 
   // For each mesh primitive, build a Three.js BufferGeometry
