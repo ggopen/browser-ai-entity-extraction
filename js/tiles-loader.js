@@ -64,6 +64,97 @@ function buildRtcTransform(featureTable) {
   return new THREE.Matrix4();
 }
 
+const COMPONENT_TYPE = {
+  5120: Int8Array,
+  5121: Uint8Array,
+  5122: Int16Array,
+  5123: Uint16Array,
+  5125: Uint32Array,
+  5126: Float32Array
+};
+const COMPONENT_BYTES = { 5120: 1, 5121: 1, 5122: 2, 5123: 2, 5125: 4, 5126: 4 };
+const TYPE_SIZE = { SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4, MAT2: 4, MAT3: 9, MAT4: 16 };
+
+// Parse a glTF 1.0 / 2.0 binary file (GLB). Returns a Three.js Group
+// with one Mesh per primitive. This is used because the embedded GLB
+// inside legacy b3dm 1.0 tiles is glTF 1.0 binary, which three.js's
+// built-in GLTFLoader no longer supports.
+function parseGlbBinary(glbBuf) {
+  const dv = new DataView(glbBuf);
+  const magic = dv.getUint32(0, true);
+  const GLB_MAGIC = 0x46546C67; // 'glTF'
+  if (magic !== GLB_MAGIC) {
+    throw new Error(`Not a GLB file (magic=${magic.toString(16)})`);
+  }
+  const version = dv.getUint32(4, true);
+  const length = dv.getUint32(8, true);
+  // Walk chunks
+  let offset = 12;
+  let json = null;
+  let binChunks = []; // { offset, byteLength }
+  while (offset < length) {
+    const chunkLen = dv.getUint32(offset, true); offset += 4;
+    const chunkType = dv.getUint32(offset, true); offset += 4;
+    const data = new Uint8Array(glbBuf, offset, chunkLen);
+    if (chunkType === 0x4E4F534A) { // 'JSON'
+      json = JSON.parse(new TextDecoder('utf-8').decode(data));
+    } else if (chunkType === 0x004E4942) { // 'BIN\0'
+      binChunks.push({ offset, byteLength: chunkLen });
+    }
+    // Pad to 4 bytes
+    offset += chunkLen + ((4 - (chunkLen % 4)) % 4);
+  }
+  if (!json) throw new Error('GLB has no JSON chunk');
+
+  const group = new THREE.Group();
+  const bin = binChunks[0];
+  if (!bin) return group;
+
+  // Helper: read accessor as a typed array view into the BIN data
+  function readAccessor(acc) {
+    const bv = json.bufferViews[acc.bufferView];
+    const compT = acc.componentType;
+    const TypedArray = COMPONENT_TYPE[compT];
+    const elemBytes = COMPONENT_BYTES[compT];
+    const typeCount = TYPE_SIZE[acc.type];
+    const total = acc.count * typeCount;
+    const byteOffset = (bv.byteOffset || 0) + (acc.byteOffset || 0);
+    return new TypedArray(glbBuf, bin.offset + byteOffset, total);
+  }
+
+  // For each mesh primitive, build a Three.js BufferGeometry
+  for (const mesh of json.meshes || []) {
+    for (const prim of mesh.primitives || []) {
+      try {
+        const g = new THREE.BufferGeometry();
+        // Attributes
+        const attrs = prim.attributes || {};
+        for (const [name, accIdx] of Object.entries(attrs)) {
+          const acc = json.accessors[accIdx];
+          const arr = readAccessor(acc);
+          const itemSize = TYPE_SIZE[acc.type];
+          // Three.js naming: POSITION, NORMAL, COLOR_0, TEXCOORD_0...
+          g.setAttribute(name, new THREE.BufferAttribute(arr, itemSize));
+        }
+        // Indices
+        if (prim.indices !== undefined) {
+          const acc = json.accessors[prim.indices];
+          const arr = readAccessor(acc);
+          const itemSize = TYPE_SIZE[acc.type];
+          g.setIndex(new THREE.BufferAttribute(arr, itemSize));
+        }
+        // Default material (no PBR; the b3dm contains baked colors)
+        const mat = new THREE.MeshBasicMaterial({ vertexColors: !!g.attributes.color, side: THREE.FrontSide });
+        const meshObj = new THREE.Mesh(g, mat);
+        group.add(meshObj);
+      } catch (e) {
+        console.warn('Failed to build primitive', e);
+      }
+    }
+  }
+  return group;
+}
+
 const gltfLoader = new GLTFLoader();
 const gltfCache = new Map();
 
@@ -78,12 +169,14 @@ function loadGlb(url) {
       const header = parseB3dmHeader(buf);
       const glbBuf = extractGlb(buf, header.glbOffset);
       const rtc = buildRtcTransform(header.featureTable);
+
+      // Try GLTFLoader first (glTF 2.0 binary); fall back to our
+      // custom glTF 1.0 binary parser on failure.
       return new Promise((resolve, reject) => {
         gltfLoader.parse(
           glbBuf,
           '',
           (gltf) => {
-            // Apply RTC_CENTER to every geometry
             gltf.scene.traverse((o) => {
               if (o.isMesh && o.geometry) {
                 o.geometry.applyMatrix4(rtc);
@@ -91,7 +184,20 @@ function loadGlb(url) {
             });
             resolve(gltf);
           },
-          (err) => reject(err)
+          () => {
+            // glTF 1.0 binary path
+            try {
+              const group = parseGlbBinary(glbBuf);
+              group.traverse((o) => {
+                if (o.isMesh && o.geometry) {
+                  o.geometry.applyMatrix4(rtc);
+                }
+              });
+              resolve({ scene: group });
+            } catch (e) {
+              reject(e);
+            }
+          }
         );
       });
     });
