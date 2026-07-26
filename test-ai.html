@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<title>AI Model Loading Test</title>
+<style>
+  body { font-family: -apple-system, monospace; padding: 20px; background: #0a0e14; color: #e6e8eb; }
+  .ok { background: rgba(109,213,140,0.15); color: #6dd58c; padding: 6px 10px; border-radius: 4px; }
+  .err { background: rgba(255,95,95,0.15); color: #ff5f5f; padding: 6px 10px; border-radius: 4px; }
+  .info { background: rgba(79,140,255,0.15); color: #4f8cff; padding: 6px 10px; border-radius: 4px; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "onnxruntime-web": "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.1/dist/esm/ort.min.js"
+  }
+}
+</script>
+</head>
+<body>
+<h1>AI Model Loading Test</h1>
+<div id="log"></div>
+
+<script type="module">
+import { getSegmentationModel } from './js/segmentation.js';
+import { logger } from './js/logger.js';
+
+const log = document.getElementById('log');
+const line = (level, msg) => {
+  const d = document.createElement('div');
+  d.className = level;
+  d.textContent = msg;
+  log.appendChild(d);
+  console.log(`[${level}] ${msg}`);
+};
+const step = (m) => line('info', m);
+const ok = (m) => line('ok', m);
+const err = (m) => line('err', m);
+
+const origInfo = logger.info.bind(logger);
+const origWarn = logger.warn.bind(logger);
+const origErr = logger.err.bind(logger);
+const origOk = logger.ok.bind(logger);
+logger.info = (m) => { line('info', m); origInfo(m); };
+logger.ok = (m) => { line('ok', m); origOk(m); };
+logger.warn = (m) => { line('info', `[warn] ${m}`); origWarn(m); };
+logger.err = (m) => { line('err', m); origErr(m); };
+
+async function run() {
+  try {
+    step('Step 1: import onnxruntime-web');
+    const ort = await import('onnxruntime-web');
+    step('Step 2: getSegmentationModel');
+    const t0 = performance.now();
+    const session = await getSegmentationModel();
+    const dt = performance.now() - t0;
+    ok(`Model loaded in ${dt.toFixed(0)} ms`);
+    ok(`Input names: ${JSON.stringify(session.inputNames)}`);
+    ok(`Output names: ${JSON.stringify(session.outputNames)}`);
+    ok('✅ AI model test passed');
+  } catch (e) {
+    err('❌ ' + e.message);
+    err('Stack: ' + (e.stack || '(no stack)'));
+  }
+}
+run();
+</script>
+</body>
+</html>
