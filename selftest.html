@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Self-test · 浏览器端 AI 分割</title>
+  <style>
+    body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; padding: 20px; max-width: 900px; margin: 0 auto; background: #0a0e14; color: #e6e8eb; }
+    h1 { color: #4f8cff; }
+    .step { padding: 8px 12px; margin: 6px 0; border-radius: 4px; font-family: "SF Mono", monospace; font-size: 12px; }
+    .ok { background: rgba(109,213,140,0.15); color: #6dd58c; }
+    .err { background: rgba(255,95,95,0.15); color: #ff5f5f; }
+    .info { background: rgba(79,140,255,0.15); color: #4f8cff; }
+    pre { background: #000; padding: 8px; border-radius: 4px; overflow-x: auto; font-size: 11px; max-height: 240px; }
+  </style>
+</head>
+<body>
+  <h1>浏览器端 AI 分割 - 自检</h1>
+  <p>本页面将依次测试：(1) 模块加载 (2) 3D Tiles 加载 (3) ONNX 模型推理 (4) 端到端流程。</p>
+  <div id="log"></div>
+  <pre id="full"></pre>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+      "onnxruntime-web": "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.1/dist/esm/ort.min.js"
+    }
+  }
+  </script>
+  <script type="module">
+    import * as THREE from 'three';
+    import { Tileset } from './js/tiles-loader.js';
+    import { inferBatch, getSegmentationModel } from './js/segmentation.js';
+
+    const log = document.getElementById('log');
+    const full = document.getElementById('full');
+    function line(level, msg) {
+      const d = document.createElement('div');
+      d.className = 'step ' + level;
+      d.textContent = msg;
+      log.appendChild(d);
+      full.textContent += msg + '\n';
+      console[level === 'err' ? 'error' : 'log'](msg);
+    }
+    function info(m) { line('info', m); }
+    function ok(m) { line('ok', m); }
+    function err(m) { line('err', m); }
+
+    async function run() {
+      try {
+        info('[1/5] 检查 WebGL 2 支持...');
+        const canvas = document.createElement('canvas');
+        const gl = canvas.getContext('webgl2');
+        if (!gl) throw new Error('WebGL 2 不可用');
+        ok('WebGL 2 可用: ' + gl.getParameter(gl.VERSION));
+
+        info('[2/5] 加载 3D Tiles tileset.json...');
+        const ts = new Tileset();
+        await ts.load('https://data.mars3d.cn/3dtiles/qx-simiao/tileset.json');
+        const sp = ts.root.root.boundingVolume.sphere;
+        ok(`tileset 加载完成, 根 sphere 半径 ${sp[3].toFixed(1)} m`);
+
+        info('[3/5] 加载首个 b3dm 瓦片...');
+        const queryBox = new THREE.Box3(
+          new THREE.Vector3(sp[0] - sp[3], sp[1] - sp[3], sp[2] - sp[3]),
+          new THREE.Vector3(sp[0] + sp[3], sp[1] + sp[3], sp[2] + sp[3])
+        );
+        const meshes = await ts.getMeshesInBox(queryBox);
+        ok(`加载 ${meshes.length} 个网格`);
+        const merged = ts.buildMergedGeometry(meshes);
+        ok(`合并几何体: 顶点 ${merged.attributes.position.count}`);
+
+        info('[4/5] 加载 ONNX 模型...');
+        const t0 = performance.now();
+        await getSegmentationModel();
+        ok(`模型加载完成, 用时 ${(performance.now() - t0).toFixed(0)} ms`);
+
+        info('[5/5] 运行模型推理 (合成测试图像)...');
+        // Build a fake 512x512 image: a 200x200 white square on black
+        const W = 512, H = 512;
+        const rgba = new Uint8ClampedArray(W * H * 4);
+        for (let y = 0; y < H; y++) {
+          for (let x = 0; x < W; x++) {
+            const i = (y * W + x) * 4;
+            const inSquare = (x > 100 && x < 412 && y > 100 && y < 412);
+            if (inSquare) {
+              rgba[i] = 230; rgba[i+1] = 230; rgba[i+2] = 230;
+            } else {
+              rgba[i] = 30; rgba[i+1] = 30; rgba[i+2] = 30;
+            }
+            rgba[i+3] = 255;
+          }
+        }
+        const t1 = performance.now();
+        const results = await inferBatch([{ name: 'test', rgb: rgba, width: W, height: H }]);
+        const dt = performance.now() - t1;
+        const r = results[0];
+        // Count foreground pixels
+        let fg = 0;
+        for (let i = 0; i < r.labels.length; i++) if (r.labels[i] > 0) fg++;
+        ok(`推理完成: 用时 ${dt.toFixed(0)} ms, 实例数 ${r.count}, 前景像素 ${fg} (期望 ~102400)`);
+        if (r.count < 1) throw new Error('模型未检测到任何前景');
+        ok('✅ 自检通过！');
+      } catch (e) {
+        err('❌ 自检失败: ' + e.message);
+        console.error(e);
+      }
+    }
+    run();
+  </script>
+</body>
+</html>
