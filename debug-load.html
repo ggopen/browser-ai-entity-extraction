@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<title>Debug: tileset load</title>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<pre id="out" style="font-family:monospace;font-size:12px;background:#000;color:#0f0;padding:12px;white-space:pre-wrap;"></pre>
+<script type="module">
+import * as THREE from 'three';
+import { Tileset } from './js/tiles-loader.js';
+import { logger } from './js/logger.js';
+
+const out = document.getElementById('out');
+const write = (...args) => {
+  const line = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
+  out.textContent += line + '\n';
+  console.log(line);
+};
+
+window.addEventListener('error', (e) => write('!! window.error:', e.message, e.error?.stack || ''));
+window.addEventListener('unhandledrejection', (e) => write('!! unhandledrejection:', e.reason?.message || e.reason, e.reason?.stack || ''));
+
+// Mirror logger to page
+const origInfo = logger.info.bind(logger);
+const origWarn = logger.warn.bind(logger);
+const origErr = logger.err.bind(logger);
+const origOk = logger.ok.bind(logger);
+logger.info = (m) => { write('[info]', m); origInfo(m); };
+logger.ok = (m) => { write('[ok]', m); origOk(m); };
+logger.warn = (m) => { write('[warn]', m); origWarn(m); };
+logger.err = (m) => { write('[err]', m); origErr(m); };
+
+async function run() {
+  try {
+    write('Step 1: load tileset');
+    const ts = new Tileset();
+    await ts.load('./mock-tileset/tileset.json');
+    write('Step 1 done. root keys:', Object.keys(ts.root));
+    write('  root.root keys:', Object.keys(ts.root.root));
+    write('  sphere:', JSON.stringify(ts.root.root.boundingVolume.sphere));
+    write('  geometricError:', ts.root.root.geometricError);
+    write('  content:', JSON.stringify(ts.root.root.content));
+    write('  children:', JSON.stringify(ts.root.root.children));
+
+    const sp = ts.root.root.boundingVolume.sphere;
+    const queryBox = new THREE.Box3(
+      new THREE.Vector3(sp[0] - sp[3], sp[1] - sp[3], sp[2] - sp[3]),
+      new THREE.Vector3(sp[0] + sp[3], sp[1] + sp[3], sp[2] + sp[3])
+    );
+    write('  queryBox:', queryBox.min.toArray(), '->', queryBox.max.toArray());
+
+    write('Step 2: call getMeshesInBox');
+    const meshes = await ts.getMeshesInBox(queryBox);
+    write('Step 2 done. meshes.length:', meshes.length);
+    if (meshes.length > 0) {
+      write('  first mesh type:', meshes[0].mesh.type, 'geom type:', meshes[0].mesh.geometry?.type);
+    }
+  } catch (e) {
+    write('!! caught:', e.message);
+    write('!! stack:', e.stack || '(no stack)');
+  }
+}
+run();
+</script>
+</body>
+</html>
