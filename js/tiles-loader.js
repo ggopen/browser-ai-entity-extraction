@@ -40,17 +40,26 @@ function parseB3dmHeader(arrayBuffer) {
   };
   if (ftJsonLen > 0) {
     // The JSON is padded with spaces / nulls to 4 bytes; trim them
-    // off before parsing.
+    // off before parsing. We treat anything <= 0x20 (whitespace and
+    // null bytes) as padding.
     const raw = new Uint8Array(arrayBuffer, 28, ftJsonLen);
     let end = ftJsonLen;
-    while (end > 0 && raw[end - 1] <= 0x20) end--;
+    while (end > 0) {
+      const b = raw[end - 1];
+      if (b === 0x20 || b === 0x09 || b === 0x0a || b === 0x0d || b === 0x00) end--;
+      else break;
+    }
     const text = new TextDecoder('utf-8').decode(raw.subarray(0, end));
     header.featureTable = JSON.parse(text);
   }
   if (btJsonLen > 0) {
     const raw = new Uint8Array(arrayBuffer, 28 + ftJsonLen + ftBinLen, btJsonLen);
     let end = btJsonLen;
-    while (end > 0 && raw[end - 1] <= 0x20) end--;
+    while (end > 0) {
+      const b = raw[end - 1];
+      if (b === 0x20 || b === 0x09 || b === 0x0a || b === 0x0d || b === 0x00) end--;
+      else break;
+    }
     const text = new TextDecoder('utf-8').decode(raw.subarray(0, end));
     header.batchTable = JSON.parse(text);
   }
@@ -108,11 +117,14 @@ function parseGlbBinary(glbBuf) {
       // The JSON chunk is padded with spaces (0x20) to 4 bytes; trim
       // them off before parsing.
       const raw = new Uint8Array(glbBuf, offset, chunkLen);
-      // Find the actual end of JSON (first 0x00 byte or end). The JSON
-      // chunk is padded with spaces (0x20) to 4 bytes; trim them off
-      // before parsing.
+      // Find the actual end of JSON by trimming any combination of
+      // null bytes, spaces, tabs, CR, LF.
       let end = chunkLen;
-      while (end > 0 && raw[end - 1] <= 0x20) end--;
+      while (end > 0) {
+        const b = raw[end - 1];
+        if (b === 0x20 || b === 0x09 || b === 0x0a || b === 0x0d || b === 0x00) end--;
+        else break;
+      }
       const text = new TextDecoder('utf-8').decode(raw.subarray(0, end));
       try {
         json = JSON.parse(text);
