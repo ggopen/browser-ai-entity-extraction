@@ -39,12 +39,20 @@ function parseB3dmHeader(arrayBuffer) {
     batchTable: null
   };
   if (ftJsonLen > 0) {
-    const jsonBytes = new Uint8Array(arrayBuffer, 28, ftJsonLen);
-    header.featureTable = JSON.parse(new TextDecoder('utf-8').decode(jsonBytes));
+    // The JSON is padded with spaces / nulls to 4 bytes; trim them
+    // off before parsing.
+    const raw = new Uint8Array(arrayBuffer, 28, ftJsonLen);
+    let end = ftJsonLen;
+    while (end > 0 && raw[end - 1] <= 0x20) end--;
+    const text = new TextDecoder('utf-8').decode(raw.subarray(0, end));
+    header.featureTable = JSON.parse(text);
   }
   if (btJsonLen > 0) {
-    const jsonBytes = new Uint8Array(arrayBuffer, 28 + ftJsonLen + ftBinLen, btJsonLen);
-    header.batchTable = JSON.parse(new TextDecoder('utf-8').decode(jsonBytes));
+    const raw = new Uint8Array(arrayBuffer, 28 + ftJsonLen + ftBinLen, btJsonLen);
+    let end = btJsonLen;
+    while (end > 0 && raw[end - 1] <= 0x20) end--;
+    const text = new TextDecoder('utf-8').decode(raw.subarray(0, end));
+    header.batchTable = JSON.parse(text);
   }
   return header;
 }
@@ -97,7 +105,27 @@ function parseGlbBinary(glbBuf) {
     const chunkType = dv.getUint32(offset, true); offset += 4;
     const data = new Uint8Array(glbBuf, offset, chunkLen);
     if (chunkType === 0x4E4F534A) { // 'JSON'
-      json = JSON.parse(new TextDecoder('utf-8').decode(data));
+      // The JSON chunk is padded with spaces (0x20) to 4 bytes; trim
+      // them off before parsing.
+      const raw = new Uint8Array(glbBuf, offset, chunkLen);
+      // Find the actual end of JSON (first 0x00 byte or end). The JSON
+      // chunk is padded with spaces (0x20) to 4 bytes; trim them off
+      // before parsing.
+      let end = chunkLen;
+      while (end > 0 && raw[end - 1] <= 0x20) end--;
+      const text = new TextDecoder('utf-8').decode(raw.subarray(0, end));
+      try {
+        json = JSON.parse(text);
+      } catch (e) {
+        logger.error(`GLB JSON 解析失败: ${e.message}`);
+        // Try to find the offending character
+        const m = /at position (\d+)/.exec(e.message);
+        if (m) {
+          const pos = parseInt(m[1], 10);
+          logger.error(`附近内容: ${JSON.stringify(text.slice(Math.max(0, pos - 20), pos + 20))}`);
+        }
+        throw e;
+      }
     } else if (chunkType === 0x004E4942) { // 'BIN\0'
       binChunks.push({ offset, byteLength: chunkLen });
     }
@@ -127,14 +155,27 @@ function parseGlbBinary(glbBuf) {
     for (const prim of mesh.primitives || []) {
       try {
         const g = new THREE.BufferGeometry();
+        // Map glTF attribute semantics to Three.js names
+        const SEMANTIC_MAP = {
+          POSITION: 'position',
+          NORMAL: 'normal',
+          TANGENT: 'tangent',
+          TEXCOORD_0: 'uv',
+          TEXCOORD_1: 'uv1',
+          TEXCOORD_2: 'uv2',
+          TEXCOORD_3: 'uv3',
+          COLOR_0: 'color',
+          JOINTS_0: 'skinIndex',
+          WEIGHTS_0: 'skinWeight'
+        };
         // Attributes
         const attrs = prim.attributes || {};
         for (const [name, accIdx] of Object.entries(attrs)) {
           const acc = json.accessors[accIdx];
           const arr = readAccessor(acc);
           const itemSize = TYPE_SIZE[acc.type];
-          // Three.js naming: POSITION, NORMAL, COLOR_0, TEXCOORD_0...
-          g.setAttribute(name, new THREE.BufferAttribute(arr, itemSize));
+          const threeName = SEMANTIC_MAP[name] || name;
+          g.setAttribute(threeName, new THREE.BufferAttribute(arr, itemSize));
         }
         // Indices
         if (prim.indices !== undefined) {
@@ -142,6 +183,10 @@ function parseGlbBinary(glbBuf) {
           const arr = readAccessor(acc);
           const itemSize = TYPE_SIZE[acc.type];
           g.setIndex(new THREE.BufferAttribute(arr, itemSize));
+        }
+        // Compute normals if missing
+        if (!g.attributes.normal) {
+          g.computeVertexNormals();
         }
         // Default material (no PBR; the b3dm contains baked colors)
         const mat = new THREE.MeshBasicMaterial({ vertexColors: !!g.attributes.color, side: THREE.FrontSide });
@@ -170,39 +215,44 @@ function loadGlb(url) {
       const glbBuf = extractGlb(buf, header.glbOffset);
       const rtc = buildRtcTransform(header.featureTable);
 
-      // Try GLTFLoader first (glTF 2.0 binary); fall back to our
-      // custom glTF 1.0 binary parser on failure.
-      return new Promise((resolve, reject) => {
-        gltfLoader.parse(
-          glbBuf,
-          '',
-          (gltf) => {
-            gltf.scene.traverse((o) => {
-              if (o.isMesh && o.geometry) {
-                o.geometry.applyMatrix4(rtc);
-              }
-            });
-            resolve(gltf);
-          },
-          () => {
-            // glTF 1.0 binary path
-            try {
-              const group = parseGlbBinary(glbBuf);
-              group.traverse((o) => {
-                if (o.isMesh && o.geometry) {
-                  o.geometry.applyMatrix4(rtc);
-                }
-              });
-              resolve({ scene: group });
-            } catch (e) {
-              reject(e);
-            }
-          }
-        );
-      });
+      // Check the GLB version. If it's glTF 1.0 binary, skip the
+      // GLTFLoader (which doesn't support it) and use our custom
+      // parser directly. If it's glTF 2.0, use GLTFLoader.
+      const glbMagic = new DataView(glbBuf).getUint32(0, true);
+      const glbVersion = new DataView(glbBuf).getUint32(4, true);
+      if (glbMagic !== 0x46546C67) {
+        // Not a GLB - try GLTFLoader anyway (handles plain glTF JSON)
+        return runGltfLoader(glbBuf, rtc);
+      }
+      if (glbVersion < 2) {
+        // glTF 1.0 binary: use our custom parser
+        const group = parseGlbBinary(glbBuf);
+        group.traverse((o) => {
+          if (o.isMesh && o.geometry) o.geometry.applyMatrix4(rtc);
+        });
+        return { scene: group };
+      }
+      // glTF 2.0 binary: use GLTFLoader
+      return runGltfLoader(glbBuf, rtc);
     });
   gltfCache.set(url, promise);
   return promise;
+}
+
+function runGltfLoader(glbBuf, rtc) {
+  return new Promise((resolve, reject) => {
+    gltfLoader.parse(
+      glbBuf,
+      '',
+      (gltf) => {
+        gltf.scene.traverse((o) => {
+          if (o.isMesh && o.geometry) o.geometry.applyMatrix4(rtc);
+        });
+        resolve(gltf);
+      },
+      (err) => reject(new Error('GLTFLoader: ' + (err?.message || err)))
+    );
+  });
 }
 
 // Build a Three.js Box3 in ECEF coords for a 3D Tiles boundingVolume.
@@ -385,7 +435,7 @@ export class Tileset {
         const t0 = performance.now();
         const gltf = await loadGlb(url);
         const dt = performance.now() - t0;
-        // Touch LRU
+        logger.info(`已加载 ${url.split('/').pop()} (${dt.toFixed(0)} ms, 网格 ${gltf.scene.children.length})`);
         if (this.tiles.has(url)) {
           this.tiles.get(url).lastUsed = performance.now();
         } else {
