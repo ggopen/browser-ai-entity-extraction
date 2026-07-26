@@ -20,8 +20,10 @@ class DiagLogger {
   }
 
   show() {
-    this.panel.classList.add('expanded');
-    this.header.classList.remove('collapsed');
+    if (this.panel) {
+      this.panel.classList.add('expanded');
+      this.header?.classList.remove('collapsed');
+    }
   }
 
   _write(level, msg) {
@@ -41,7 +43,7 @@ class DiagLogger {
       }
       this.body.scrollTop = this.body.scrollHeight;
     }
-    if (level === 'err' || level === 'warn') {
+    if ((level === 'err' || level === 'warn') && this.panel) {
       // Auto-show panel for errors/warnings
       this.show();
     }
