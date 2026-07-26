@@ -159,18 +159,38 @@ function boxIntersects(a, b) {
 // the file that contains this subtree, used to resolve relative content
 // URLs. This is async because inner tilesets may need to be fetched
 // (their URL ends in .json).
+//
+// We stop recursing when:
+//  - maxDepth is reached, OR
+//  - the tile's geometricError is already small enough for the query
+//    box size (i.e. further subdivision would not improve resolution
+//    relative to the area we care about).
 async function collectLeafTiles(root, queryBox, out, baseUrl, fetchJson, depth = 0, maxDepth = 25) {
   if (!root || depth > maxDepth) return;
   const box = makeBoundingBox3(root.boundingVolume);
   if (box.isEmpty()) return;
   if (!boxIntersects(box, queryBox)) return;
 
+  // Stop condition: geometric error is small enough relative to the
+  // query box. We want a few pixels of mesh per meter of scene, so
+  // stopping at ~0.25 m geometric error is reasonable for the
+  // 30m x 30m default bbox.
+  const minAcceptableError = 0.5;
+  if (root.geometricError !== undefined && root.geometricError < minAcceptableError && depth > 2) {
+    // Use this tile's content (b3dm) as the leaf
+    if (root.content && root.content.url) {
+      const ref = root.content.url;
+      if (!/\.json($|\?)/i.test(ref)) {
+        out.push({ tile: root, baseUrl });
+        return;
+      }
+    }
+  }
+
   // If this node has a content URL pointing to a sub-tileset JSON, the
-  // node is essentially a reference to that sub-tileset (the children
-  // declared here, if any, are typically redundant with the
-  // sub-tileset's children). We always recurse into the sub-tileset
-  // when its bounding box intersects our query box, and we ignore the
-  // inline children (which would otherwise re-fetch the same data).
+  // node is essentially a reference to that sub-tileset. We always
+  // recurse into the sub-tileset when its bounding box intersects our
+  // query box.
   if (root.content && root.content.url) {
     const ref = root.content.url;
     const isJson = /\.json($|\?)/i.test(ref);
@@ -188,26 +208,17 @@ async function collectLeafTiles(root, queryBox, out, baseUrl, fetchJson, depth =
       } catch (err) {
         logger.warn(`子 tileset 加载失败 ${url}: ${err.message}`);
       }
-      // Still descend into inline children in case there are additional
-      // tiles here (e.g. loose b3dm content references).
-      if (root.children && root.children.length > 0) {
-        for (const child of root.children) {
-          await collectLeafTiles(child, queryBox, out, baseUrl, fetchJson, depth + 1, maxDepth);
-        }
-      }
       return;
     } else {
-      // Binary content (b3dm) at this node
+      // Binary content (b3dm) at this node with no children - record as leaf
       if (!root.children || root.children.length === 0) {
         out.push({ tile: root, baseUrl });
         return;
       }
-      // Has children AND binary content: descend into children to find
-      // the higher-detail versions.
     }
   }
 
-  // If this node has children, descend.
+  // Descend into children.
   if (root.children && root.children.length > 0) {
     for (const child of root.children) {
       await collectLeafTiles(child, queryBox, out, baseUrl, fetchJson, depth + 1, maxDepth);
