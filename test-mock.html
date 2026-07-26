@@ -102,6 +102,7 @@
         ok('✅ glTF 1.0 binary parser test passed');
       } catch (e) {
         err('❌ Test failed: ' + e.message);
+        err('Stack: ' + (e.stack || '(no stack)'));
         console.error(e);
       }
     }
