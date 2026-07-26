@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>Debug b3dm parser</title>
+</head>
+<body>
+  <h1>Debug b3dm parser</h1>
+  <pre id="out"></pre>
+  <script>
+    const out = document.getElementById('out');
+    const log = (m) => { out.textContent += m + '\n'; console.log(m); };
+
+    async function run() {
+      try {
+        const r = await fetch('./mock-tileset/tile.b3dm');
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const buf = await r.arrayBuffer();
+        log('b3dm size: ' + buf.byteLength);
+
+        const dv = new DataView(buf);
+        const B3DM_MAGIC = 0x6d643362;
+        const magic = dv.getUint32(0, true);
+        log('b3dm magic: ' + magic.toString(16) + (magic === B3DM_MAGIC ? ' OK' : ' BAD'));
+        const ftJsonLen = dv.getUint32(12, true);
+        const ftBinLen = dv.getUint32(16, true);
+        const btJsonLen = dv.getUint32(20, true);
+        const btBinLen = dv.getUint32(24, true);
+        const glbOffset = 28 + ftJsonLen + ftBinLen + btJsonLen + btBinLen;
+        log('ftJsonLen=' + ftJsonLen + ' ftBinLen=' + ftBinLen + ' btJsonLen=' + btJsonLen + ' btBinLen=' + btBinLen);
+        log('glbOffset=' + glbOffset);
+
+        // Trim feature table
+        if (ftJsonLen > 0) {
+          const raw = new Uint8Array(buf, 28, ftJsonLen);
+          let end = ftJsonLen;
+          while (end > 0 && raw[end - 1] <= 0x20) end--;
+          const text = new TextDecoder('utf-8').decode(raw.subarray(0, end));
+          log('ftJson end after trim: ' + end + ' (was ' + ftJsonLen + ')');
+          log('ftJson: ' + text);
+        }
+
+        const glbBuf = buf.slice(glbOffset);
+        log('glb size: ' + glbBuf.byteLength);
+
+        const gdv = new DataView(glbBuf);
+        const GLB_MAGIC = 0x46546c67;
+        const glbMagic = gdv.getUint32(0, true);
+        log('glb magic: ' + glbMagic.toString(16) + (glbMagic === GLB_MAGIC ? ' OK' : ' BAD'));
+        const glbVersion = gdv.getUint32(4, true);
+        const glbLength = gdv.getUint32(8, true);
+        log('glb version=' + glbVersion + ' length=' + glbLength);
+
+        // Read first chunk
+        const chunkLen = gdv.getUint32(12, true);
+        const chunkType = gdv.getUint32(16, true);
+        log('chunkLen=' + chunkLen + ' chunkType=' + chunkType.toString(16) + ' (expected 0x4e4f534a)');
+        const raw = new Uint8Array(glbBuf, 20, chunkLen);
+        let end = chunkLen;
+        while (end > 0 && raw[end - 1] <= 0x20) end--;
+        log('trimmed end: ' + end);
+        const text = new TextDecoder('utf-8').decode(raw.subarray(0, end));
+        log('text length: ' + text.length);
+        log('text head: ' + text.slice(0, 100));
+        log('text tail: ' + text.slice(-50));
+        try {
+          const j = JSON.parse(text);
+          log('JSON parsed OK');
+          log('keys: ' + Object.keys(j).join(','));
+        } catch (e) {
+          log('JSON parse error: ' + e.message);
+          const m = /at position (\d+)/.exec(e.message);
+          if (m) {
+            const pos = parseInt(m[1], 10);
+            log('  near position ' + pos + ': ' + JSON.stringify(text.slice(Math.max(0, pos - 20), pos + 20)));
+          }
+        }
+      } catch (e) {
+        log('Error: ' + e.message + '\n' + e.stack);
+      }
+    }
+    run();
+  </script>
+</body>
+</html>
