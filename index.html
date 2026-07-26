@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>空间实体点击提取引擎 (AI 版)</title>
+  <link rel="stylesheet" href="./css/styles.css" />
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+      "onnxruntime-web": "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.1/dist/esm/ort.min.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <div id="canvas-container"></div>
+
+    <!-- Top loading banner -->
+    <div id="loading-banner" class="loading-banner">
+      <div class="loading-content">
+        <div class="loading-text">AI 模型加载中…</div>
+        <div class="progress-bar">
+          <div class="progress-fill" id="progress-fill"></div>
+        </div>
+        <div class="loading-detail" id="loading-detail">准备中…</div>
+      </div>
+    </div>
+
+    <!-- Ready status -->
+    <div id="ready-status" class="ready-status hidden">
+      <span class="dot"></span>
+      AI 就绪
+    </div>
+
+    <!-- Top toolbar -->
+    <div class="top-toolbar">
+      <div class="logo">空间实体点击提取引擎 (AI 版)</div>
+      <button id="settings-btn" class="tool-btn" title="设置">⚙ 设置</button>
+    </div>
+
+    <!-- Settings panel -->
+    <div id="settings-panel" class="settings-panel hidden">
+      <div class="panel-header">
+        <h3>设置</h3>
+        <button id="close-settings" class="close-btn">×</button>
+      </div>
+      <div class="panel-body">
+        <label class="setting-row">
+          <span>模型精度</span>
+          <select id="model-precision">
+            <option value="speed">速度优先 (U2Net-P)</option>
+            <option value="accuracy" disabled>精度优先 (未提供)</option>
+          </select>
+        </label>
+        <label class="setting-row">
+          <span>包围盒边长 (m)</span>
+          <input type="number" id="bbox-size" min="10" max="200" value="30" step="5" />
+        </label>
+        <label class="setting-row">
+          <span>视角数量</span>
+          <select id="view-count">
+            <option value="3">3 视角</option>
+            <option value="5" selected>5 视角</option>
+            <option value="6">6 视角</option>
+          </select>
+        </label>
+        <label class="setting-row">
+          <span>渲染分辨率</span>
+          <select id="render-res">
+            <option value="256">256×256</option>
+            <option value="512" selected>512×512</option>
+          </select>
+        </label>
+        <label class="setting-row">
+          <span>几何降级方案</span>
+          <input type="checkbox" id="fallback-enabled" checked />
+        </label>
+        <button id="retry-model" class="primary-btn">重试加载模型</button>
+      </div>
+    </div>
+
+    <!-- AI processing indicator -->
+    <div id="ai-indicator" class="ai-indicator hidden">
+      <div class="spinner"></div>
+      <span>AI 分析中…</span>
+    </div>
+
+    <!-- Property panel for selected entity -->
+    <div id="property-panel" class="property-panel hidden">
+      <div class="panel-header">
+        <h3>实体属性</h3>
+        <button id="close-property" class="close-btn">×</button>
+      </div>
+      <div class="panel-body">
+        <div class="prop-row">
+          <span class="prop-label">实体编号</span>
+          <span class="prop-value" id="prop-id">-</span>
+        </div>
+        <div class="prop-row">
+          <span class="prop-label">类别</span>
+          <select id="prop-class" class="prop-value"></select>
+        </div>
+        <div class="prop-row">
+          <span class="prop-label">AI 识别置信度</span>
+          <span class="prop-value" id="prop-conf">-</span>
+        </div>
+        <div class="prop-row">
+          <span class="prop-label">中心经度</span>
+          <span class="prop-value" id="prop-lon">-</span>
+        </div>
+        <div class="prop-row">
+          <span class="prop-label">中心纬度</span>
+          <span class="prop-value" id="prop-lat">-</span>
+        </div>
+        <div class="prop-row">
+          <span class="prop-label">中心高程 (m)</span>
+          <span class="prop-value" id="prop-elev">-</span>
+        </div>
+        <div class="prop-row">
+          <span class="prop-label">面积 (m²)</span>
+          <span class="prop-value" id="prop-area">-</span>
+        </div>
+        <div class="prop-row">
+          <span class="prop-label">高度 (m)</span>
+          <span class="prop-value" id="prop-height">-</span>
+        </div>
+        <div class="prop-row">
+          <span class="prop-label">顶点数</span>
+          <span class="prop-value" id="prop-vertex">-</span>
+        </div>
+        <div class="prop-row">
+          <span class="prop-label">三角面数</span>
+          <span class="prop-value" id="prop-faces">-</span>
+        </div>
+        <div class="action-row">
+          <button id="export-glb" class="primary-btn">导出 GLB</button>
+          <button id="export-geojson" class="primary-btn">导出 GeoJSON</button>
+          <button id="delete-entity" class="danger-btn">删除</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Entity list -->
+    <div id="entity-list" class="entity-list hidden">
+      <div class="panel-header">
+        <h3>实体列表</h3>
+        <span id="entity-count" class="count-badge">0</span>
+      </div>
+      <div class="panel-body" id="entity-list-body"></div>
+    </div>
+
+    <!-- Help hint -->
+    <div class="help-hint">
+      <strong>操作提示:</strong> 鼠标左键点击建筑物或地物 · 鼠标右键拖动旋转 · 滚轮缩放
+    </div>
+
+    <!-- Diagnostic panel -->
+    <div id="diag-panel" class="diag-panel">
+      <div class="diag-header" id="diag-header">诊断日志</div>
+      <div class="diag-body" id="diag-body"></div>
+    </div>
+  </div>
+
+  <script type="module" src="./js/main.js"></script>
+</body>
+</html>
