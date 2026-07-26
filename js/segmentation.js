@@ -18,7 +18,11 @@ function loadOrt() {
     if (mod.env) {
       // Use the CDN-hosted WASM files for the WASM backend.
       mod.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.1/dist/';
-      mod.env.wasm.numThreads = Math.min(4, navigator.hardwareConcurrency || 2);
+      // Multi-threaded WASM requires SharedArrayBuffer and cross-origin
+      // isolation. GitHub Pages does not set COOP/COEP headers, so the
+      // threaded worker would silently fail. Force single-threaded mode
+      // to keep startup deterministic in non-isolated contexts.
+      mod.env.wasm.numThreads = 1;
       mod.env.wasm.simd = true;
     }
     return mod;
